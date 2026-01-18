@@ -1,12 +1,9 @@
-#include <iostream>
-#include <vector>
 #include <chrono>
-#include <thread>
-#include <atomic>
-#include <csignal>
+#include <iostream>
+#include <sys/select.h>
 #include <termios.h>
+#include <thread>
 #include <unistd.h>
-#include <fcntl.h>
 
 constexpr int FIELD_WIDTH = 80;
 constexpr int FIELD_HEIGHT = 24;
@@ -22,21 +19,15 @@ public:
         termios raw = old_;
         raw.c_lflag &= ~(ICANON | ECHO);
         tcsetattr(STDIN_FILENO, TCSANOW, &raw);
-
-        // non‑blocking stdin
-        oldFlags_ = fcntl(STDIN_FILENO, F_GETFL, 0);
-        fcntl(STDIN_FILENO, F_SETFL, oldFlags_ | O_NONBLOCK);
     }
 
     ~TerminalRawMode()
     {
         tcsetattr(STDIN_FILENO, TCSANOW, &old_);
-        fcntl(STDIN_FILENO, F_SETFL, oldFlags_);
     }
 
 private:
     termios old_{};
-    int oldFlags_{};
 };
 
 struct Vec2
@@ -87,11 +78,10 @@ public:
         while (running_)
         {
             auto now = clock::now();
-            std::chrono::duration<float> dt = now - last;
             last = now;
 
             handleInput();
-            update(dt.count());
+            update();
             render();
 
             if (score1_ >= WIN_SCORE || score2_ >= WIN_SCORE)
@@ -99,7 +89,7 @@ public:
                 running_ = false;
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60 FPS
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
         }
 
         clearScreen();
@@ -118,8 +108,7 @@ private:
     int score1_{0};
     int score2_{0};
     bool running_{true};
-
-    float speedMultiplier_ = 1.0f;
+    float speed_ = 0.5f;
 
 private:
     static void clearScreen()
@@ -129,8 +118,20 @@ private:
 
     void handleInput()
     {
-        int ch = getchar();
-        if (ch == EOF)
+        timeval tv{};
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+
+        int ready = select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv);
+        if (ready <= 0)
+            return;
+
+        char ch;
+        if (read(STDIN_FILENO, &ch, 1) <= 0)
             return;
 
         switch (ch)
@@ -155,91 +156,55 @@ private:
         }
     }
 
-    void update(float dt)
+    void update()
     {
-        // Move ball
-        ball_.pos.x += ball_.vel.x * speedMultiplier_;
-        ball_.pos.y += ball_.vel.y * speedMultiplier_;
+        ball_.pos.x += ball_.vel.x * speed_;
+        ball_.pos.y += ball_.vel.y * speed_;
 
-        // Top / bottom collision
         if (ball_.pos.y <= 0 || ball_.pos.y >= FIELD_HEIGHT - 1)
         {
             ball_.vel.y = -ball_.vel.y;
         }
 
-        // Left paddle collision
-        if (static_cast<int>(ball_.pos.x) == 2)
+        if ((int)ball_.pos.x == 2)
         {
-            if (static_cast<int>(ball_.pos.y) >= p1_.y &&
-                static_cast<int>(ball_.pos.y) < p1_.y + PADDLE_HEIGHT)
+            if ((int)ball_.pos.y >= p1_.y &&
+                (int)ball_.pos.y < p1_.y + PADDLE_HEIGHT)
             {
-
                 ball_.vel.x = -ball_.vel.x;
-                addSpin(p1_);
-                speedUp();
+                speed_ *= 1.05f;
             }
         }
 
-        // Right paddle collision
-        if (static_cast<int>(ball_.pos.x) == FIELD_WIDTH - 3)
+        if ((int)ball_.pos.x == FIELD_WIDTH - 3)
         {
-            if (static_cast<int>(ball_.pos.y) >= p2_.y &&
-                static_cast<int>(ball_.pos.y) < p2_.y + PADDLE_HEIGHT)
+            if ((int)ball_.pos.y >= p2_.y &&
+                (int)ball_.pos.y < p2_.y + PADDLE_HEIGHT)
             {
-
                 ball_.vel.x = -ball_.vel.x;
-                addSpin(p2_);
-                speedUp();
+                speed_ *= 1.05f;
             }
         }
 
-        // Score
         if (ball_.pos.x < 0)
         {
             score2_++;
-            speedMultiplier_ = 1.0f;
+            speed_ = 1.0f;
             ball_.reset(+1);
         }
 
         if (ball_.pos.x > FIELD_WIDTH - 1)
         {
             score1_++;
-            speedMultiplier_ = 1.0f;
+            speed_ = 1.0f;
             ball_.reset(-1);
         }
-
-        // Simple AI for Player 2 if you comment manual controls
-        aiMove();
-    }
-
-    void aiMove()
-    {
-        int target = static_cast<int>(ball_.pos.y);
-        int center = p2_.y + PADDLE_HEIGHT / 2;
-
-        if (target < center)
-            p2_.moveUp();
-        else if (target > center)
-            p2_.moveDown();
-    }
-
-    void addSpin(const Paddle &paddle)
-    {
-        int paddleCenter = paddle.y + PADDLE_HEIGHT / 2;
-        float diff = ball_.pos.y - paddleCenter;
-        ball_.vel.y += diff * 0.05f; // spin
-    }
-
-    void speedUp()
-    {
-        speedMultiplier_ *= 1.05f; // progressive difficulty
     }
 
     void render()
     {
         clearScreen();
 
-        // Top border
         for (int i = 0; i < FIELD_WIDTH + 2; ++i)
             std::cout << '#';
         std::cout << '\n';
@@ -250,8 +215,7 @@ private:
 
             for (int x = 0; x < FIELD_WIDTH; ++x)
             {
-                if (x == static_cast<int>(ball_.pos.x) &&
-                    y == static_cast<int>(ball_.pos.y))
+                if (x == (int)ball_.pos.x && y == (int)ball_.pos.y)
                 {
                     std::cout << 'O';
                 }
@@ -259,7 +223,8 @@ private:
                 {
                     std::cout << '|';
                 }
-                else if (x == FIELD_WIDTH - 2 && y >= p2_.y && y < p2_.y + PADDLE_HEIGHT)
+                else if (x == FIELD_WIDTH - 2 &&
+                         y >= p2_.y && y < p2_.y + PADDLE_HEIGHT)
                 {
                     std::cout << '|';
                 }
@@ -276,22 +241,21 @@ private:
             std::cout << "#\n";
         }
 
-        // Bottom border
         for (int i = 0; i < FIELD_WIDTH + 2; ++i)
             std::cout << '#';
         std::cout << '\n';
 
-        std::cout << "P1: " << score1_ << "   P2: " << score2_ << '\n';
-        std::cout << "Controls: P1(w/s), P2(o/l), q = quit" << '\n';
+        std::cout << "P1: " << score1_
+                  << "   P2: " << score2_ << "\n";
+        std::cout << "Controls: w/s and o/l | q = quit\n";
     }
 };
 
 int main()
 {
-    std::cout << "Terminal Pong (C++)\n";
-    std::cout << "Press w/s and o/l to move paddles. q to quit.\n";
-    std::cout << "First to " << WIN_SCORE << " wins.\n";
-    std::cout << "Press Enter to start..." << std::endl;
+    std::cout << "Terminal Pong (macOS)\n";
+    std::cout << "Controls: w/s and o/l, q to quit\n";
+    std::cout << "Press Enter to start...\n";
     std::cin.get();
 
     PongGame game;
